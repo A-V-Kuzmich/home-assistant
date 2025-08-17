@@ -1,0 +1,100 @@
+esphome:
+  name: water-meter
+  friendly_name: Water-meter
+
+esp8266: # chose your bord
+  board: esp01_1m 
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: "Pyq...." # add your key
+
+ota:
+  - platform: esphome
+    password: "d4...." # add your pass
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Water-Meter Fallback Hotspot"
+    password: "ha...." # add your pass
+
+captive_portal:
+
+globals:
+  - id: empty_distance
+    type: float
+    initial_value: '1.45'  # m — empty tank, distance from the sensor to the minimum level of possible water intake (pipes)
+  - id: calibration_work_distance
+    type: float
+    initial_value: '0.20'  # m - is the correction factor, the distance from the sensor to the water mirror
+  - id: radius
+    type: float
+    initial_value: '0.3'  # m -  is the radius of the tub
+  - id: calibration_factor
+    type: float
+    initial_value: '0.01'  # m -  is the calibration coefficient of the sensor
+
+sensor:
+  - platform: ultrasonic
+    id: distance_sensor
+    name: "distance"
+    unit_of_measurement: "m"
+    update_interval: 5s
+    trigger_pin: 5
+    echo_pin: 4
+    filters:
+      - median:
+          window_size: 5
+          send_every: 2
+          send_first_at: 1
+      - lambda: |-
+          if (isnan(x)) return NAN;
+          float corrected = x + id(calibration_factor);
+          return corrected;
+      - delta: 0.01
+      - round: 2
+    on_value:
+      then:
+        - lambda: |-
+            float d = id(distance_sensor).state;
+            if (isnan(d)) {
+              id(liters_sensor).publish_state(0);
+              id(percent_sensor).publish_state(0);
+              return;
+            }
+
+            float work_zone = id(empty_distance) - id(calibration_work_distance);
+            float radius_squared = id(radius) * id(radius);
+            float level = work_zone - (d - id(calibration_work_distance));
+            float volume_m3 = 3.14 * radius_squared * level;
+            float percent = ((id(empty_distance) - d) / work_zone) * 100.0;
+
+            if (percent < 0) percent = 0;
+
+            id(liters_sensor).publish_state(volume_m3 * 1000.0);
+            id(percent_sensor).publish_state(percent);
+
+
+  - platform: template
+    id: liters_sensor
+    name: "Liters"
+    unit_of_measurement: "л"
+    accuracy_decimals: 1
+    icon: "mdi:barrel"
+    update_interval: never  # <-- does not update itself
+
+  - platform: template
+    id: percent_sensor
+    name: "%"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    icon: "mdi:water-percent"
+    update_interval: never # <-- does not update itself
