@@ -42,6 +42,20 @@ globals:
     type: float
     initial_value: '0.01'  # m -  is the calibration coefficient of the sensor
 
+  - id: timeout_counter
+    type: int
+    initial_value: '0'
+
+  - id: total_timeouts
+    type: int
+    initial_value: '0'
+    restore_value: yes
+
+  - id: last_timeout_at_uptime
+    type: float
+    initial_value: '-1'
+    restore_value: yes
+
 sensor:
   - platform: ultrasonic
     id: distance_sensor
@@ -55,8 +69,24 @@ sensor:
           window_size: 5
           send_every: 2
           send_first_at: 1
-      - lambda: |-
-          if (isnan(x)) return NAN;
+          - lambda: |-
+          if (isnan(x)) {
+            id(timeout_counter)++;
+            id(total_timeouts)++;
+            id(last_timeout_at_uptime) = id(uptime_sensor).state;
+
+            ESP_LOGW("distance_raw", "Timeouts: %d | Total: %d", id(timeout_counter), id(total_timeouts));
+
+            if (id(timeout_counter) > 20) {
+              ESP_LOGE("distance_raw", "TOO MANY TIMEOUTS — RESTARTING ESP!");
+              ESP.restart();
+            }
+            return NAN;
+          }
+          id(timeout_counter) = 0;
+
+          ESP_LOGI("distance_raw", "RAW DISTANCE = %.5f m", x);
+
           float corrected = x + id(calibration_factor);
           return corrected;
       - delta: 0.01
@@ -82,7 +112,7 @@ sensor:
             id(liters_sensor).publish_state(volume_m3 * 1000.0);
             id(percent_sensor).publish_state(percent);
 
-
+    
   - platform: template
     id: liters_sensor
     name: "Liters"
@@ -98,3 +128,35 @@ sensor:
     accuracy_decimals: 0
     icon: "mdi:water-percent"
     update_interval: never # <-- does not update itself
+
+# logs:
+  - platform: uptime
+    id: uptime_sensor
+    update_interval: 5s
+    
+  - platform: template
+    id: uptime_minutes
+    name: "Uptime (min)"
+    unit_of_measurement: "min"
+    lambda: |-
+      return id(uptime_sensor).state / 60.0;
+
+  - platform: template
+    id: minutes_since_last_timeout
+    name: "Minutes since last timeout"
+    unit_of_measurement: "min"
+    update_interval: 30s
+    lambda: |-
+      if (id(last_timeout_at_uptime) < 0) return -1;
+      float diff = (id(uptime_sensor).state - id(last_timeout_at_uptime)) / 60.0;
+      return diff;
+
+  - platform: template
+    id: timeout_rate
+    name: "Timeouts per hour avg"
+    unit_of_measurement: "timeout/h"
+    update_interval: 60s
+    lambda: |-
+      float hours = id(uptime_sensor).state / 3600.0;
+      if (hours < 0.01) return 0;
+      return id(total_timeouts) / hours;
