@@ -1,0 +1,51 @@
+esphome:
+  on_boot:
+    - priority: -10
+      then:
+        - lambda: 'id(total_restarts) += 1;'
+
+globals:
+  - id: total_restarts
+    type: int
+    restore_value: yes 
+    initial_value: '0'
+
+sensor:
+  - platform: wifi_signal
+    name: "WiFi Signal dB"
+    id: wifi_signal_db
+    update_interval: 60s
+    entity_category: "diagnostic"
+
+  - platform: copy 
+    source_id: wifi_signal_db
+    name: "WiFi Signal Percent"
+    filters:
+      - lambda: return min(max(2 * (x + 100.0), 0.0), 100.0);
+    unit_of_measurement: "Signal %"
+    entity_category: "diagnostic"
+    device_class: ""
+
+  - platform: template
+    name: "Total Restarts Count"
+    entity_category: "diagnostic"
+    icon: "mdi:counter"
+    lambda: 'return id(total_restarts);'
+
+  - platform: uptime
+    id: uptime_sensor
+    internal: true 
+    update_interval: 60s
+
+  - platform: template
+    id: uptime_minutes
+    name: "Uptime"
+    unit_of_measurement: "min"
+    entity_category: "diagnostic"
+    device_class: "duration"
+    accuracy_decimals: 1
+    filters:
+      - delta: 1.0
+    lambda: |-
+      if (isnan(id(uptime_sensor).state)) return 0;
+      return id(uptime_sensor).state / 60.0;
