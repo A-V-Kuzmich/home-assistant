@@ -1,0 +1,489 @@
+esphome:
+  name: diesel-heater
+  friendly_name: Diesel Heater
+
+packages:
+  diagnostics: !include common/wi-fi-diagnostic.yaml
+# or
+  # diagnostics:
+  # url: https://github.com/A-V-Kuzmich/home-assistant
+  # file: Wi-Fi-diagnostic.yaml
+  # refresh: 1d 
+
+esp32:
+  board: esp32-c3-devkitm-1
+  variant: esp32c3
+  flash_size: 4MB
+  cpu_frequency: 80MHZ
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO       
+  baud_rate: 0 
+
+api:
+  encryption:
+    key: !secret diesel_heater_api_key
+
+ota:
+  - platform: esphome
+    password: !secret diesel_heater_ota_password
+
+  - platform: web_server
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  min_auth_mode: WPA2
+  power_save_mode: LIGHT
+  output_power: 8.5dB
+  fast_connect: True
+    
+  ap:
+    ssid: "Diesel Heater Fallback Hotspot"
+    password: !secret wifi_ap_password
+
+web_server:
+  port: 80
+  auth: 
+    username: !secret web_server_user
+    password: !secret web_server_pass
+
+captive_portal:
+
+uart:
+  id: heater_uart
+  rx_pin: GPIO20
+  baud_rate: 25000
+  rx_buffer_size: 2048
+  stop_bits: 1
+  parity: NONE
+  data_bits: 8
+
+output:
+  - platform: gpio
+    pin: 6
+    id: physical_pin_down
+    inverted: false
+
+  - platform: gpio
+    pin: 10
+    id: physical_pin_up
+    inverted: false
+
+  - platform: gpio
+    pin: 7
+    id: physical_pin_power
+    inverted: false
+
+globals:
+  - id: session_fuel
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+
+  - id: fuel_calib_factor
+    type: float
+    restore_value: yes 
+    initial_value: '1.05'
+
+  - id: stable_hz
+    type: float
+    initial_value: '0.0'
+
+  - id: pending_hz
+    type: float
+    initial_value: '0.0'
+
+  - id: stable_count
+    type: int
+    initial_value: '0'
+
+button:
+  - platform: template
+    name: "Heater DOWN (-)"
+    icon: "mdi:arrow-down-bold"
+    on_press:
+      - output.turn_on: physical_pin_down
+      - delay: 200ms
+      - output.turn_off: physical_pin_down
+
+  - platform: template
+    name: "Heater UP (+)"
+    icon: "mdi:arrow-up-bold"
+    on_press:
+      - output.turn_on: physical_pin_up
+      - delay: 200ms
+      - output.turn_off: physical_pin_up
+
+  - platform: template
+    name: "Heater Power Pulse (Diag)"
+    id: heater_power_pulse_diag
+    icon: "mdi:lightning-bolt"
+    entity_category: "diagnostic"
+    on_press:
+      - output.turn_on: physical_pin_power
+      - delay: 200ms
+      - output.turn_off: physical_pin_power
+
+  - platform: template
+    name: "Heater Stop Pulse (Diag)"
+    id: heater_stop_pulse_diag
+    icon: "mdi:power-off"
+    entity_category: "diagnostic"
+    on_press:
+      - output.turn_on: physical_pin_power
+      - delay: 3000ms
+      - output.turn_off: physical_pin_power
+
+switch:
+  - platform: template
+    name: "Heater Power"
+    icon: "mdi:power"
+    id: heater_switch
+    lambda: |-
+      if (id(start_sequence).is_running()) return true;  
+      if (id(stop_sequence).is_running()) return false; 
+      return id(heater_stable_status).state;            
+    
+    turn_on_action:
+      - if:
+          condition:
+            and:
+              - binary_sensor.is_off: heater_stable_status
+              - not:
+                  script.is_running: stop_sequence
+          then:
+            - script.execute: start_sequence
+            
+    turn_off_action:
+      - if:
+          condition:
+            and:
+              - binary_sensor.is_on: heater_stable_status
+              - not:
+                  script.is_running: start_sequence
+          then:
+            - script.execute: stop_sequence
+
+binary_sensor:
+  - platform: template
+    id: heater_stable_status
+    internal: true
+    lambda: |-
+      return id(run_state).state >= 1; 
+    filters:
+      - delayed_on: 2s
+      - delayed_off: 2s
+
+sensor:
+  - platform: template
+    name: "Input Voltage"
+    id: b05_voltage
+    unit_of_measurement: "V"
+    accuracy_decimals: 1
+    icon: "mdi:car-battery"
+    filters:
+      - delta: 1
+      - debounce: 200ms
+      - throttle: 2s
+
+  - platform: template
+    name: "Fan Speed"
+    id: b06_b07_rpm
+    unit_of_measurement: "RPM"
+    accuracy_decimals: 0
+    icon: "mdi:fan"
+    filters:
+      - throttle: 2s
+      - delta: 100
+          
+  - platform: template
+    name: "Fan Speed %"
+    id: b09_rpm_pct
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    icon: "mdi:percent"
+    filters:
+      - delta: 5
+      - debounce: 100ms
+      - throttle: 2s
+
+  - platform: template
+    name: "Heater Temp"
+    id: b11_temp
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    icon: "mdi:thermometer"
+    filters:
+      - throttle: 2s
+      - delta: 1
+
+  - &common_Hz
+    platform: template
+    name: "Pump Hz (Real)"
+    id: b16_real
+    unit_of_measurement: "Hz"
+    accuracy_decimals: 1
+    icon: "mdi:speedometer"
+    filters:
+      - delta: 0.05
+
+  - <<: *common_Hz
+    name: "Pump Hz (Target)"
+    id: b19_target
+    icon: "mdi:target"
+
+  - platform: template
+    id: run_state
+    internal: true
+    update_interval: 1s     
+
+  - platform: template
+    id: raw_run_state
+    internal: true
+    on_value:
+      then:
+        - script.execute: update_heater_status_text
+
+  - platform: template
+    id: raw_error_code
+    internal: true
+    on_value:
+      then:
+        - script.execute: update_heater_status_text
+
+  - platform: template
+    name: "Fuel Flow Rate"
+    unit_of_measurement: "L/h"
+    accuracy_decimals: 3
+    icon: "mdi:gas-station"
+    lambda: "return id(stable_hz) * 0.022 * id(fuel_calib_factor) * 3.6;"
+
+  - platform: template
+    name: "Session Fuel Consumed"
+    id: session_fuel_sensor
+    unit_of_measurement: "L"
+    accuracy_decimals: 3
+    state_class: total_increasing
+    device_class: water
+    icon: "mdi:fuel"
+    lambda: "return id(session_fuel);"
+
+number:
+  - platform: template
+    name: "Fuel Correction Factor"
+    id: fuel_correction
+    entity_category: "diagnostic"
+    icon: "mdi:calculator-variant"
+    min_value: 0.80
+    max_value: 1.25
+    step: 0.01
+    mode: box
+    lambda: "return id(fuel_calib_factor);"
+    set_action:
+      then:
+        - lambda: "id(fuel_calib_factor) = x;"
+
+text_sensor:
+  - platform: template
+    name: "Heater Status"
+    id: heater_status_text
+    icon: "mdi:information-outline"
+
+  - platform: template
+    name: "Last Reset Reason"
+    id: last_reset_reason
+    entity_category: "diagnostic"
+    icon: "mdi:restart-alert"
+    lambda: |-
+      switch (esp_reset_reason()) {
+        case ESP_RST_POWERON:  return std::string("Power On / Hard Reset");
+        case ESP_RST_EXT:      return std::string("External Pin Reset");
+        case ESP_RST_SW:       return std::string("Software Restart (Update)");
+        case ESP_RST_PANIC:    return std::string("Crash / Exception");
+        case ESP_RST_INT_WDT:  return std::string("Watchdog (Frozen)");
+        case ESP_RST_BROWNOUT: return std::string("BROWNOUT (Voltage Drop!)");
+        default:               return std::string("Other");
+      }
+
+interval:
+  - interval: 100ms
+    then:
+      - lambda: |-
+          static uint8_t buf[128];
+          static uint16_t len = 0;
+
+          // 1. Читаємо UART
+          while (id(heater_uart).available()) {
+            if (len < sizeof(buf)) {
+              uint8_t c;
+              id(heater_uart).read_byte(&c);
+              buf[len++] = c;
+            } else {
+              len = 0;
+              break;
+            }
+          }
+
+          if (len < 24) return;
+
+          int last_valid = -1;
+
+          // 2. Пошук найновішого валідного пакету 
+          for (int i = 0; i <= (int)len - 24; i++) {
+            if (buf[i] != 0x76 || buf[i+1] != 0x16 || buf[i+21] != 0x00)
+              continue;
+
+            uint16_t crc = 0xFFFF;
+            for (uint8_t j = 0; j < 22; j++) {
+              crc ^= buf[i+j];
+              for (uint8_t b = 0; b < 8; b++)
+                crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : (crc >> 1);
+            }
+
+            uint16_t remote = (uint16_t(buf[i+22]) << 8) | buf[i+23];
+            if (crc == remote)
+              last_valid = i;
+          }
+
+          // 3. Якщо знайшли — парсимо 
+          if (last_valid >= 0) {
+            uint8_t *p = &buf[last_valid];
+
+            id(run_state).publish_state(p[3]);
+            id(raw_run_state).publish_state(p[2]);
+            id(raw_error_code).publish_state(p[17]);
+            id(b05_voltage).publish_state(p[5] / 10.0);
+
+            uint16_t rpm = (uint16_t(p[6]) << 8) | p[7];
+            id(b06_b07_rpm).publish_state(rpm);
+
+            id(b09_rpm_pct).publish_state(p[9]);
+            id(b11_temp).publish_state(p[11]);
+            id(b16_real).publish_state(p[16] / 10.0);
+            id(b19_target).publish_state(p[19] / 10.0);
+
+            uint16_t used = last_valid + 24;
+            if (used < len) {
+              memmove(buf, buf + used, len - used);
+              len -= used;
+            } else {
+              len = 0;
+            }
+
+          } else if (len > 100) {
+            len = 0;
+          }
+           
+  - interval: 1s
+    then:
+      - lambda: |-
+          float raw_hz = id(b16_real).state;
+          if (isnan(raw_hz)) raw_hz = 0.0;
+
+          // АЛГОРИТМ СТАБІЛЬНОСТІ (Чекаємо 4 секунди однакових значень)
+          if (std::abs(raw_hz - id(pending_hz)) < 0.1) {
+            id(stable_count)++;
+          } else {
+            id(pending_hz) = raw_hz;
+            id(stable_count) = 1;
+          }
+
+          if (id(stable_count) >= 4) {
+            // ЛОГІКА НОВОЇ СЕСІЇ
+            // Якщо пічка стояла (0) і почала качати (>0) — обнуляємо лічильник
+            if (id(pending_hz) > 0 && id(stable_hz) == 0) {
+              id(session_fuel) = 0;
+            }
+            id(stable_hz) = id(pending_hz);
+          }
+
+          if (id(stable_hz) > 0) {
+            float consumed_this_sec = (id(stable_hz) * 0.022 * id(fuel_calib_factor)) / 1000.0;
+            id(session_fuel) += consumed_this_sec;
+          }
+ # =================виведення 24 біт у лог при debug логуванні
+  # - interval: 50ms
+  #   then:
+  #     - lambda: |-
+  #         if (id(heater_uart).available()) {
+  #           std::string packet_hex = "";
+  #           while (id(heater_uart).available()) {
+  #             uint8_t c;
+  #             id(heater_uart).read_byte(&c);
+  #             char buf[5];
+  #             sprintf(buf, "%02X ", c);
+  #             packet_hex += buf;
+  #           }
+  #           ESP_LOGD("SCANNER", "Зловлено на лінії: %s", packet_hex.c_str());
+  #         }
+
+script:
+  - id: start_sequence
+    mode: single 
+    then:
+      - output.turn_on: physical_pin_power
+      - delay: 200ms
+      - output.turn_off: physical_pin_power
+      - wait_until:
+          condition:
+            binary_sensor.is_on: heater_stable_status
+          timeout: 120s
+      - delay: 5s
+
+  - id: stop_sequence
+    mode: single
+    then:
+      - output.turn_on: physical_pin_power
+      - delay: 2000ms 
+      - output.turn_off: physical_pin_power
+      - wait_until:
+          condition:
+            binary_sensor.is_off: heater_stable_status
+          timeout: 180s
+      - delay: 5s
+
+  - id: update_heater_status_text
+    mode: restart
+    then:
+      - lambda: |-
+          auto *ts = id(heater_status_text);
+
+          int err = (int) id(raw_error_code).state;
+          int st  = (int) id(raw_run_state).state;
+
+          if (err > 0) {
+            switch(err) {
+              case 2: ts->publish_state("Error E-01 (Volt Low)"); break;
+              case 3: ts->publish_state("Error E-02 (Volt High)"); break;
+              case 4: ts->publish_state("Error E-03 (Ignition plug failure)"); break;
+              case 5: ts->publish_state("Error E-04 (Pump Fail)"); break;
+              case 6: ts->publish_state("Error E-05 (Overheat)"); break;
+              case 7: ts->publish_state("Error E-06 (Motor Fail)"); break;
+              case 8: ts->publish_state("Error E-07 (Com Lost)"); break;
+              case 9: ts->publish_state("Error E-08 (Flameout)"); break;
+              case 10: ts->publish_state("Error E-09 (Sensor Fail)"); break;
+              case 11: ts->publish_state("Error E-10 (Ignition)"); break;
+              default:
+                ts->publish_state(("Error E-" + to_string(err)).c_str());
+                break;
+            }
+            return;
+          }
+
+          switch(st) {
+            case 0: ts->publish_state("Off"); break;
+            case 1: ts->publish_state("Starting"); break;
+            case 2: ts->publish_state("Pre-Heating"); break;
+            case 3: ts->publish_state("Failed Start - Retrying"); break;
+            case 4: ts->publish_state("Ignition - Now heating up"); break;
+            case 5: ts->publish_state("Running Normally"); break;
+            case 6: ts->publish_state("Stop Command Received"); break;
+            case 7: ts->publish_state("Stopping"); break;
+            case 8: ts->publish_state("Cooldown"); break;
+            default:
+              ts->publish_state(("Unknown (" + to_string(st) + ")").c_str());
+              break;
+          }
